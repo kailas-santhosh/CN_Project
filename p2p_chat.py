@@ -1,6 +1,8 @@
 import socket
 import threading
 import time
+import os
+import hashlib
 import json
 from datetime import datetime
 import logging
@@ -261,47 +263,53 @@ class P2PChatNode:
         try:
             while self.running and self.peer_socket:
                 try:
-                    # First get message length (4 bytes)
-                    msg_length_bytes = self.peer_socket.recv(4)
-                    if not msg_length_bytes or len(msg_length_bytes) != 4:
-                        break
-                    
-                    msg_length = int.from_bytes(msg_length_bytes, byteorder='big')
-                    if msg_length <= 0 or msg_length > 65536:  # Sanity check
+                    # First get the message type (1 byte)
+                    msg_type = self.peer_socket.recv(1)
+                    if not msg_type:
                         break
 
-                    encrypted_msg = b''
-                    remaining = msg_length
-                
-                    while remaining > 0:
-                        try:
-                            chunk = self.peer_socket.recv(min(4096, remaining))
-                            if not chunk:
+                    if msg_type == b'M':  # Regular message
+                        # Then get message length (4 bytes)
+                        msg_length_bytes = self.peer_socket.recv(4)
+                        if not msg_length_bytes or len(msg_length_bytes) != 4:
+                            break
+                        
+                        msg_length = int.from_bytes(msg_length_bytes, byteorder='big')
+                        encrypted_msg = b''
+                        remaining = msg_length
+                    
+                        while remaining > 0:
+                            try:
+                                chunk = self.peer_socket.recv(min(4096, remaining))
+                                if not chunk:
+                                    break
+                                encrypted_msg += chunk
+                                remaining -= len(chunk)
+                            except socket.timeout:
+                                continue
+                            except ConnectionResetError:
                                 break
-                            encrypted_msg += chunk
-                            remaining -= len(chunk)
-                        except socket.timeout:
-                            continue
-                        except ConnectionResetError:
+
+                        if remaining > 0:  # Didn't receive full message
                             break
 
-                    if remaining > 0:  # Didn't receive full message
-                        break
-
-                    try:
-                        message = self.decrypt_message(encrypted_msg, self.private_key)
-                        timestamp = datetime.now().strftime('%H:%M')
-                    
-                        # Clear current line and print message above prompt
-                        sys.stdout.write(f"\r\033[K")  # Clear line
-                        sys.stdout.write(f"[{timestamp}] {self.active_peer}: {message}\n")
-                        sys.stdout.write(f"You ({self.username}) > ")
-                        sys.stdout.flush()
+                        try:
+                            message = self.decrypt_message(encrypted_msg, self.private_key)
+                            timestamp = datetime.now().strftime('%H:%M')
                         
-                    except Exception as e:
-                        logging.error(f"Message decryption failed: {str(e)}")
-                        continue
-                    
+                            # Clear current line and print message above prompt
+                            sys.stdout.write(f"\r\033[K")  # Clear line
+                            sys.stdout.write(f"[{timestamp}] {self.active_peer}: {message}\n")
+                            sys.stdout.write(f"You ({self.username}) > ")
+                            sys.stdout.flush()
+                            
+                        except Exception as e:
+                            logging.error(f"Message decryption failed: {str(e)}")
+                            continue
+
+                    elif msg_type == b'F':  # File transfer
+                        self.handle_file_transfer()
+
                 except socket.timeout:
                     continue
                 except ConnectionResetError:
@@ -314,6 +322,112 @@ class P2PChatNode:
             logging.error(f"Message handler crashed: {str(e)}")
         finally:
             self.cleanup_connection()
+
+    def handle_file_transfer(self):
+        try:
+            # Receive file metadata (encrypted)
+            metadata_length_bytes = self.peer_socket.recv(4)
+            if not metadata_length_bytes or len(metadata_length_bytes) != 4:
+                return
+            
+            metadata_length = int.from_bytes(metadata_length_bytes, byteorder='big')
+            encrypted_metadata = self.peer_socket.recv(metadata_length)
+            
+            metadata = json.loads(self.decrypt_message(encrypted_metadata, self.private_key))
+            filename = metadata['filename']
+            filesize = metadata['filesize']
+            filehash = metadata['filehash']
+            
+            print(f"\n[File Transfer] Receiving {filename} ({filesize/1024:.2f} KB)")
+            print(f"You ({self.username}) > ", end="", flush=True)
+            
+            # Create downloads directory if it doesn't exist
+            os.makedirs('downloads', exist_ok=True)
+            filepath = os.path.join('downloads', filename)
+            
+            # Receive file content in chunks
+            hasher = hashlib.sha256()
+            received = 0
+            with open(filepath, 'wb') as f:
+                while received < filesize:
+                    chunk = self.peer_socket.recv(min(4096, filesize - received))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    hasher.update(chunk)
+                    received += len(chunk)
+            
+            # Verify file hash
+            if hasher.hexdigest() == filehash:
+                print(f"\n[File Transfer] Successfully received {filename}")
+            else:
+                print(f"\n[File Transfer] Warning: File hash mismatch for {filename}")
+                os.remove(filepath)
+            
+            print(f"You ({self.username}) > ", end="", flush=True)
+            
+        except Exception as e:
+            print(f"\n[File Transfer] Error receiving file: {str(e)}")
+            print(f"You ({self.username}) > ", end="", flush=True)
+
+    def send_file(self, filepath):
+        if not self.connection_established or not self.peer_socket:
+            print("\n[System] Not connected to any peer")
+            print(f"You ({self.username}) > ", end="", flush=True)
+            return False
+        
+        try:
+            if not os.path.exists(filepath):
+                print(f"\n[File Transfer] File not found: {filepath}")
+                print(f"You ({self.username}) > ", end="", flush=True)
+                return False
+            
+            filename = os.path.basename(filepath)
+            filesize = os.path.getsize(filepath)
+            
+            # Calculate file hash
+            hasher = hashlib.sha256()
+            with open(filepath, 'rb') as f:
+                while chunk := f.read(4096):
+                    hasher.update(chunk)
+            filehash = hasher.hexdigest()
+            
+            # Prepare metadata
+            metadata = {
+                'filename': filename,
+                'filesize': filesize,
+                'filehash': filehash
+            }
+            
+            # Encrypt and send metadata
+            encrypted_metadata = self.encrypt_message(json.dumps(metadata), 
+                                                    self.peers[self.active_peer]['public_key'])
+            
+            # Send file transfer indicator
+            self.peer_socket.send(b'F')
+            
+            # Send metadata length
+            self.peer_socket.send(len(encrypted_metadata).to_bytes(4, byteorder='big'))
+            
+            # Send metadata
+            self.peer_socket.send(encrypted_metadata)
+            
+            print(f"\n[File Transfer] Sending {filename} ({filesize/1024:.2f} KB)...")
+            print(f"You ({self.username}) > ", end="", flush=True)
+            
+            # Send file content
+            with open(filepath, 'rb') as f:
+                while chunk := f.read(4096):
+                    self.peer_socket.send(chunk)
+            
+            print(f"\n[File Transfer] File sent successfully")
+            print(f"You ({self.username}) > ", end="", flush=True)
+            return True
+            
+        except Exception as e:
+            print(f"\n[File Transfer] Error sending file: {str(e)}")
+            self.cleanup_connection()
+            return False
 
     def cleanup_connection(self):
         if self.peer_socket:
@@ -332,6 +446,9 @@ class P2PChatNode:
             return False
         
         try:
+            # Send message type indicator
+            self.peer_socket.send(b'M')
+            
             encrypted_msg = self.encrypt_message(
                 message,
                 self.peers[self.active_peer]['public_key']
@@ -391,6 +508,7 @@ class P2PChatNode:
         print("/list - List discovered peers")
         print("/connect <username> - Connect to a peer")
         print("/msg <message> - Send message to connected peer")
+        print("/sendfile <filepath> - Send file to connected peer")
         print("/disconnect - Disconnect from current peer")
         print("/exit - Quit the application")
 
@@ -456,6 +574,20 @@ class P2PChatNode:
                         continue
                     
                     self.send_message(parts[1])
+                
+                elif command.startswith("/sendfile"):
+                    if not self.connection_established:
+                        print("\n[System] Not connected to any peer")
+                        print(f"You ({self.username}) > ", end="", flush=True)
+                        continue
+                    
+                    parts = command.split(maxsplit=1)
+                    if len(parts) < 2:
+                        print("\nUsage: /sendfile <filepath>")
+                        print(f"You ({self.username}) > ", end="", flush=True)
+                        continue
+                    
+                    self.send_file(parts[1])
                 
                 else:
                     print("\n[System] Unknown command. Type /help for help.")
