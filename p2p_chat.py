@@ -40,6 +40,18 @@ class P2PChatNode:
         if not self.setup_listening_socket():
             raise Exception("Failed to setup listening socket")
 
+    def get_local_ip(self):
+        """Get the actual LAN IP address"""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))  # Connect to Google's DNS server
+            local_ip = s.getsockname()[0]
+            s.close()
+            return local_ip
+        except Exception as e:
+            logging.error(f"Could not determine LAN IP: {e}")
+            return socket.gethostbyname(socket.gethostname())  # Fallback
+
     def find_available_port(self):
         """Find an available port starting from 5000"""
         for port in range(5000, 6000):
@@ -98,7 +110,7 @@ class P2PChatNode:
                     
                     broadcast_msg = json.dumps({
                         'username': self.username,
-                        'ip': socket.gethostbyname(socket.gethostname()),
+                        'ip': self.get_local_ip(),  # Use corrected IP detection
                         'port': self.listening_port,
                         'public_key': pub_key_pem
                     })
