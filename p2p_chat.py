@@ -118,7 +118,10 @@ class P2PChatNode:
     def start_udp_listener(self):
         def listener_loop():
             udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # Add both reuse options
             udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, 'SO_REUSEPORT'):  # For macOS compatibility
+                udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             try:
                 udp_socket.bind(('0.0.0.0', 37020))
                 
@@ -178,9 +181,19 @@ class P2PChatNode:
                     self.peer_socket.recv(1024),
                     backend=self.backend
                 )
-                
+
+                stored_key = self.peers[peer_username]['public_key'].public_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PublicFormat.SubjectPublicKeyInfo
+                )
+
+                received_key = peer_public_key.public_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PublicFormat.SubjectPublicKeyInfo
+                )
+
                 # Verify the public key matches
-                if peer_public_key != self.peers[peer_username]['public_key']:
+                if stored_key != received_key:
                     print("Security alert: Public key mismatch!")
                     self.peer_socket.close()
                     return False
