@@ -11,7 +11,6 @@ from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.backends import default_backend
 import sys
 import select
-import netifaces  # Added for better IP detection
 
 # Configure logging
 logging.basicConfig(
@@ -23,7 +22,7 @@ logging.basicConfig(
 )
 
 class P2PChatNode:
-    def __init__(self, username, port=None):
+    def __init__(self, username):
         self.backend = default_backend()
         self.username = username
         self.private_key, self.public_key = self.generate_keys()
@@ -31,64 +30,33 @@ class P2PChatNode:
         self.active_peer = None
         self.peer_socket = None
         self.listening_socket = None
-        # self.listening_port = self.find_available_port()
-        self.listening_port = port if port else self.find_available_port()
+        self.listening_port = self.find_available_port()
         self.running = False
         self.udp_broadcast_interval = 10
         self.connection_established = False
         self.message_lock = threading.Lock()
         self.connection_lock = threading.Lock()
         
-        print(f"Starting node with IP: {self.get_local_ip()}, Port: {self.listening_port}")
-        
         if not self.setup_listening_socket():
             raise Exception("Failed to setup listening socket")
 
     def get_local_ip(self):
-        """Get the actual LAN IP address with multiple fallback methods"""
+        """Get the actual LAN IP address"""
         try:
-            ips = []
-            
-            # Method 1: UDP connection to Google DNS
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.connect(("8.8.8.8", 80))
-                ips.append(s.getsockname()[0])
-                s.close()
-            except:
-                pass
-            
-            # Method 2: Network interfaces
-            try:
-                for interface in netifaces.interfaces():
-                    for link in netifaces.ifaddresses(interface).get(netifaces.AF_INET, []):
-                        if 'addr' in link and not link['addr'].startswith('127.'):
-                            ips.append(link['addr'])
-            except:
-                pass
-            
-            # Method 3: Hostname lookup
-            try:
-                ips.append(socket.gethostbyname(socket.gethostname()))
-            except:
-                pass
-            
-            # Return the first valid IP we found
-            for ip in ips:
-                if ip and not ip.startswith('127.'):
-                    return ip
-                    
-            return '127.0.0.1'
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))  # Connect to Google's DNS server
+            local_ip = s.getsockname()[0]
+            s.close()
+            return local_ip
         except Exception as e:
             logging.error(f"Could not determine LAN IP: {e}")
-            return '127.0.0.1'
+            return socket.gethostbyname(socket.gethostname())  # Fallback
 
     def find_available_port(self):
         """Find an available port starting from 5000"""
         for port in range(5000, 6000):
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 sock.bind(('0.0.0.0', port))
                 sock.close()
                 return port
@@ -109,8 +77,6 @@ class P2PChatNode:
         try:
             self.listening_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.listening_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            if hasattr(socket, 'SO_REUSEPORT'):
-                self.listening_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             self.listening_socket.bind(('0.0.0.0', self.listening_port))
             self.listening_socket.listen(5)
             logging.info(f"Listening on port {self.listening_port}")
@@ -144,14 +110,12 @@ class P2PChatNode:
                     
                     broadcast_msg = json.dumps({
                         'username': self.username,
-                        'ip': '127.0.0.1',  # Force localhost for testing
+                        'ip': self.get_local_ip(),  # Use corrected IP detection
                         'port': self.listening_port,
                         'public_key': pub_key_pem
                     })
                     
-                    # Send to both broadcast and localhost
                     udp_socket.sendto(broadcast_msg.encode('utf-8'), ('255.255.255.255', 37020))
-                    udp_socket.sendto(broadcast_msg.encode('utf-8'), ('127.0.0.1', 37020))
                     time.sleep(self.udp_broadcast_interval)
                     
                 except Exception as e:
@@ -166,8 +130,9 @@ class P2PChatNode:
     def start_udp_listener(self):
         def listener_loop():
             udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # Add both reuse options
             udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            if hasattr(socket, 'SO_REUSEPORT'):
+            if hasattr(socket, 'SO_REUSEPORT'):  # For macOS compatibility
                 udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             try:
                 udp_socket.bind(('0.0.0.0', 37020))
@@ -187,7 +152,7 @@ class P2PChatNode:
                                 'port': peer_info['port'],
                                 'public_key': public_key
                             }
-                            logging.info(f"Discovered peer: {peer_info['username']} at {peer_info['ip']}:{peer_info['port']}")
+                            logging.info(f"Discovered peer: {peer_info['username']}")
                     except Exception as e:
                         logging.error(f"UDP listener error: {str(e)}")
             finally:
@@ -208,26 +173,15 @@ class P2PChatNode:
         
         try:
             with self.connection_lock:
-                print(f"Attempting to connect to {peer_username} at {peer_info['ip']}:{peer_info['port']}...")
+                print(f"Attempting to connect to {peer_username}...")
                 self.peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.peer_socket.settimeout(10)  # Increased timeout
-                
-                # Set socket options for better connectivity
-                self.peer_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                if hasattr(socket, 'SO_REUSEPORT'):
-                    self.peer_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                self.peer_socket.settimeout(5)
                 
                 try:
+                    # Connect to the peer's listening port
                     self.peer_socket.connect((peer_info['ip'], peer_info['port']))
-                    print("TCP connection established, starting handshake...")
                 except socket.timeout:
-                    print("Connection timed out. Possible issues:")
-                    print(f"1. Is {peer_username} running and listening on port {peer_info['port']}?")
-                    print(f"2. Is there a firewall blocking port {peer_info['port']}?")
-                    print(f"3. Is the IP address correct? (Tried connecting to {peer_info['ip']})")
-                    return False
-                except ConnectionRefusedError:
-                    print(f"Connection refused. Is {peer_username} running and accepting connections?")
+                    print("Connection timed out. Is the other peer waiting?")
                     return False
                 
                 # Exchange public keys
@@ -280,11 +234,9 @@ class P2PChatNode:
         while self.running:
             try:
                 conn, addr = self.listening_socket.accept()
-                print(f"\nIncoming connection from {addr[0]}:{addr[1]}")
                 
                 # Only accept one connection at a time
                 if self.connection_established:
-                    print("Already connected to another peer, rejecting")
                     conn.close()
                     continue
                     
