@@ -11,6 +11,8 @@ from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.backends import default_backend
 import sys
 import select
+import cv2  # OpenCV used for video capture and display
+import numpy as np  # For converting image bytes to numpy array
 
 # Configure logging
 logging.basicConfig(
@@ -36,6 +38,9 @@ class P2PChatNode:
         self.connection_established = False
         self.message_lock = threading.Lock()
         self.connection_lock = threading.Lock()
+
+        # Video call flag to avoid multiple calls at once
+        self.video_call_active = False
         
         if not self.setup_listening_socket():
             raise Exception("Failed to setup listening socket")
@@ -335,6 +340,12 @@ class P2PChatNode:
                     elif msg_type == b'F':  # File transfer
                         self.handle_file_transfer()
 
+                    elif msg_type == b'V':  # Video call signal
+                        # When receiving a video call request (for simplicity, auto-accept)
+                        if not self.video_call_active:
+                            print("\n[System] Video call request received. Starting video call...")
+                            threading.Thread(target=self.start_video_call, daemon=True).start()
+
                 except socket.timeout:
                     continue
                 except ConnectionResetError:
@@ -527,6 +538,118 @@ class P2PChatNode:
         if self.listening_socket:
             self.listening_socket.close()
 
+    ##############################################################################
+    # Video call implementation
+    ##############################################################################
+    def start_video_call(self):
+        """
+        Starts a bidirectional video call by launching separate threads for sending and
+        receiving video frames over UDP.
+        """
+        if self.video_call_active:
+            print("[System] Video call already active.")
+            return
+        
+        self.video_call_active = True
+        print("[System] Video call started. Press 'q' in the video window to end the call.")
+
+        # Start sender and receiver threads
+        threading.Thread(target=self.send_video_stream, daemon=True).start()
+        threading.Thread(target=self.receive_video_stream, daemon=True).start()
+
+    def send_video_stream(self):
+        """
+        Capture video from the webcam, compress each frame as JPEG, and send it over UDP.
+        The destination port is derived from the peer's chat listening port plus 100.
+        """
+        # Ensure a connection to peer exists
+        if self.active_peer is None or self.active_peer not in self.peers:
+            print("[System] No active peer for video call.")
+            self.video_call_active = False
+            return
+        
+        peer_ip = self.peers[self.active_peer]['ip']
+        # Define destination video port: peer's chat port + 100
+        dest_port = self.peers[self.active_peer]['port'] + 100
+
+        cap = cv2.VideoCapture(0)
+        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_sock.settimeout(0.5)
+
+        try:
+            while self.video_call_active:
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+                # Encode frame as JPEG
+                ret, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
+                if not ret:
+                    continue
+                data = buffer.tobytes()
+                # Send the frame size (4 bytes) followed by the JPEG data
+                size = len(data)
+                try:
+                    udp_sock.sendto(size.to_bytes(4, byteorder='big') + data, (peer_ip, dest_port))
+                except Exception as e:
+                    logging.error(f"Video send error: {e}")
+                time.sleep(0.05)  # Control frame rate
+        finally:
+            cap.release()
+            udp_sock.close()
+
+    def receive_video_stream(self):
+        """
+        Receive video frames over UDP on local video port (chat listening port + 100) and display them.
+        """
+        local_video_port = self.listening_port + 100
+        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            udp_sock.bind(('0.0.0.0', local_video_port))
+        except Exception as e:
+            print(f"[System] Unable to bind video receive socket: {e}")
+            self.video_call_active = False
+            return
+
+        udp_sock.settimeout(1.0)
+        cv2.namedWindow("Video Call", cv2.WINDOW_NORMAL)
+        try:
+            while self.video_call_active:
+                try:
+                    # Receive entire packet containing size + data
+                    packet, addr = udp_sock.recvfrom(65507)  # Max UDP packet size
+                    if len(packet) < 4:
+                        continue
+
+                    # Extract frame size from first 4 bytes
+                    frame_size = int.from_bytes(packet[:4], byteorder='big')
+                    # Check if the remaining data matches the frame_size
+                    if len(packet[4:]) != frame_size:
+                        continue  # Corrupted or incomplete frame
+
+                    frame_data = packet[4:]
+                    # Decode the JPEG data into a frame
+                    np_arr = np.frombuffer(frame_data, np.uint8)
+                    frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                    if frame is not None:
+                        cv2.imshow("Video Call", frame)
+                        # Break the video call loop if 'q' is pressed in the video window
+                        if cv2.waitKey(1) & 0xFF == ord('q'):
+                            self.video_call_active = False
+                            break
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    logging.error(f"Video receive error: {e}")
+                    continue
+        finally:
+            cv2.destroyAllWindows()
+            udp_sock.close()
+            print("\n[System] Video call ended.")
+
+    ##############################################################################
+        # End video call implementation
+    ##############################################################################
+
     def display_help(self):
         print("\nAvailable commands:")
         print("/help - Show this help")
@@ -534,6 +657,7 @@ class P2PChatNode:
         print("/connect <username> - Connect to a peer")
         print("/msg <message> - Send message to connected peer")
         print("/sendfile <filepath> - Send file to connected peer")
+        print("/videocall - Start video call with connected peer")
         print("/disconnect - Disconnect from current peer")
         print("/exit - Quit the application")
 
@@ -613,6 +737,21 @@ class P2PChatNode:
                         continue
                     
                     self.send_file(parts[1])
+                
+                elif command.lower() == "/videocall":
+                    if not self.connection_established:
+                        print("\n[System] Not connected to any peer")
+                    else:
+                        # Send a short video call signal over main TCP connection so that the peer auto-starts
+                        try:
+                            self.peer_socket.send(b'V')
+                        except Exception as e:
+                            print(f"\n[System] Unable to initiate video call: {e}")
+                            continue
+                        # Start the video call locally (if not already active)
+                        if not self.video_call_active:
+                            threading.Thread(target=self.start_video_call, daemon=True).start()
+                    print(f"You ({self.username}) > ", end="", flush=True)
                 
                 else:
                     print("\n[System] Unknown command. Type /help for help.")
