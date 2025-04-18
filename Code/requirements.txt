@@ -1,0 +1,16 @@
+# Core dependencies
+cryptography>=41.0.0
+opencv-python>=4.7.0
+numpy>=1.24.0
+sounddevice>=0.4.6
+pyaudio>=0.2.13
+
+# Additional runtime dependencies
+pygame>=2.3.0  # For audio handling on some systems
+six>=1.16.0    # Compatibility package
+tqdm>=4.65.0   # Optional: For progress bars during file transfers
+
+# Development dependencies (optional)
+pytest>=7.3.1
+black>=23.3.0
+flake8>=6.0.0
