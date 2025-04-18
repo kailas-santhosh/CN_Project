@@ -13,6 +13,7 @@ import sys
 import select
 import cv2  # OpenCV used for video capture and display
 import numpy as np  # For converting image bytes to numpy array
+import sounddevice as sd
 
 # Configure logging
 logging.basicConfig(
@@ -38,6 +39,10 @@ class P2PChatNode:
         self.connection_established = False
         self.message_lock = threading.Lock()
         self.connection_lock = threading.Lock()
+        self.SAMPLE_RATE = 16000  # Reduced sample rate for lower bandwidth
+        self.CHUNK_SIZE = 1024    # Number of frames per buffer
+        self.AUDIO_FORMAT = np.int16  # 16-bit PCM
+        self.CHANNELS = 1  
 
         # Video call flag to avoid multiple calls at once
         self.video_call_active = False
@@ -541,22 +546,81 @@ class P2PChatNode:
     ##############################################################################
     # Video call implementation
     ##############################################################################
+   
     def start_video_call(self):
-        """
-        Starts a bidirectional video call by launching separate threads for sending and
-        receiving video frames over UDP.
-        """
-        if self.video_call_active:
-            print("[System] Video call already active.")
+            """
+            Starts a bidirectional video and voice call by launching threads for
+            sending/receiving both video and audio over separate UDP ports.
+            """
+            if self.video_call_active:
+                print("[System] Video call already active.")
+                return
+            
+            self.video_call_active = True
+            print("[System] Video+Voice call started. Press 'q' in video window to end.")
+
+            # Start video and audio threads
+            threading.Thread(target=self.send_video_stream, daemon=True).start()
+            threading.Thread(target=self.receive_video_stream, daemon=True).start()
+            threading.Thread(target=self.send_audio_stream, daemon=True).start()
+            threading.Thread(target=self.receive_audio_stream, daemon=True).start()
+
+    def send_audio_stream(self):
+        """Capture audio from microphone and stream via UDP"""
+        if not self.video_call_active or self.active_peer not in self.peers:
             return
+
+        peer_ip = self.peers[self.active_peer]['ip']
+        audio_port = self.peers[self.active_peer]['port'] + 101  # Audio port offset
+
+        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         
-        self.video_call_active = True
-        print("[System] Video call started. Press 'q' in the video window to end the call.")
+        try:
+            with sd.InputStream(
+                samplerate=self.SAMPLE_RATE,
+                channels=self.CHANNELS,
+                dtype=self.AUDIO_FORMAT,
+                blocksize=self.CHUNK_SIZE
+            ) as stream:
+                while self.video_call_active:
+                    data, _ = stream.read(self.CHUNK_SIZE)
+                    try:
+                        udp_sock.sendto(data.tobytes(), (peer_ip, audio_port))
+                    except Exception as e:
+                        logging.error(f"Audio send error: {e}")
+        except Exception as e:
+            logging.error(f"Audio input error: {e}")
+        finally:
+            udp_sock.close()
 
-        # Start sender and receiver threads
-        threading.Thread(target=self.send_video_stream, daemon=True).start()
-        threading.Thread(target=self.receive_video_stream, daemon=True).start()
-
+    def receive_audio_stream(self):
+        """Receive and play incoming audio stream via UDP"""
+        audio_port = self.listening_port + 101  # Local audio port
+        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        
+        try:
+            udp_sock.bind(('0.0.0.0', audio_port))
+            udp_sock.settimeout(1.0)
+            
+            with sd.OutputStream(
+                samplerate=self.SAMPLE_RATE,
+                channels=self.CHANNELS,
+                dtype=self.AUDIO_FORMAT,
+                blocksize=self.CHUNK_SIZE
+            ) as stream:
+                while self.video_call_active:
+                    try:
+                        data, _ = udp_sock.recvfrom(4096)
+                        audio_data = np.frombuffer(data, dtype=self.AUDIO_FORMAT)
+                        stream.write(audio_data)
+                    except socket.timeout:
+                        continue
+                    except Exception as e:
+                        logging.error(f"Audio receive error: {e}")
+        except Exception as e:
+            logging.error(f"Audio output error: {e}")
+        finally:
+            udp_sock.close()
     def send_video_stream(self):
         """
         Capture video from the webcam, compress each frame as JPEG, and send it over UDP.
